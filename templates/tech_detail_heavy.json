@@ -1,0 +1,7 @@
+{
+  "name": "tech_detail_heavy",
+  "display_name": "Tech Detail Heavy",
+  "writing_style": "Technical, jargon-rich, with specific tool, version, and architecture callouts in every bullet",
+  "persona": "A deeply technical individual who communicates through precision and specificity — version numbers, architectural decisions, trade-off rationale, and tool chains are front and center.",
+  "instructions": "Reference specific technologies with versions where realistic (e.g., 'Python 3.11', 'PostgreSQL 15', 'React 18 with TypeScript 5', 'Kubernetes 1.28'). Call out cloud providers (AWS, GCP, Azure) with specific services (S3, Lambda, BigQuery, AKS). Mention CI/CD tooling (GitHub Actions, Jenkins, ArgoCD), testing frameworks (pytest, Jest, Cypress), and observability tools (Datadog, Grafana, OpenTelemetry). Use technical verbs: 'architected', 'refactored', 'instrumented', 'containerized', 'migrated', 'profiled'. Achievements should focus on performance improvements (latency, throughput, p99), uptime percentages, cost reductions from optimizations. Always include GitHub or portfolio URL. Certifications (AWS SAA, CKA, GCP-ACE) are a plus."
+}

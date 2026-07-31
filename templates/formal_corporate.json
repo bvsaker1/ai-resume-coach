@@ -1,0 +1,7 @@
+{
+  "name": "formal_corporate",
+  "display_name": "Formal Corporate",
+  "writing_style": "Professional, formal, structured with traditional section headers",
+  "persona": "A seasoned professional who follows traditional resume conventions, using formal language and conservative formatting preferred by Fortune 500 companies and established enterprises.",
+  "instructions": "Write in a formal, polished tone throughout. Use third-person-adjacent action verbs: 'Managed', 'Directed', 'Oversaw', 'Administered', 'Coordinated', 'Facilitated'. Summaries should be written as complete, professional statements. Quantify achievements using business metrics (percentages, dollar amounts, headcount). Include a LinkedIn URL. Avoid slang, contractions, or startup jargon. Education section should be prominently featured. Use conservative language that would be appropriate in a boardroom presentation. Structure is paramount — every section should follow a predictable, professional format."
+}

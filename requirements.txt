@@ -1,0 +1,9 @@
+groq>=1.1.1
+pydantic>=2.12.5
+pydantic[email]>=2.12.5
+instructor>=1.7.0
+python-dotenv>=1.0.0
+sentence-transformers>=3.0.0
+scikit-learn>=1.5.0
+pytest>=7.0.0
+pytest-mock>=3.14.0

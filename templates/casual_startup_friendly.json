@@ -1,0 +1,7 @@
+{
+  "name": "casual_startup_friendly",
+  "display_name": "Casual Startup Friendly",
+  "writing_style": "Conversational, energetic, startup-culture-aware with emphasis on ownership, impact, and passion for growth",
+  "persona": "A dynamic self-starter who thrives in ambiguous, fast-paced environments. Has worn many hats, values impact over titles, and is excited to keep leveling up.",
+  "instructions": "Use an upbeat, first-person tone in the summary — e.g. 'I love building things that ship.' Use startup vernacular: 'shipped', 'owned', 'drove impact', 'wore many hats', 'spun up', 'iterated fast', 'moved the needle'. Emphasize speed, autonomy, and growth mindset. Reference modern startup tools where relevant (Slack, Notion, Figma, Linear, Loom). Keep bullet points punchy and under 15 words each. Include a portfolio or GitHub link. Show scrappiness — solving problems with limited resources. Avoid stiff corporate language. The vibe should feel like a strong Medium post or a tweet thread from a founder."
+}

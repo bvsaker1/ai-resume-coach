@@ -1,0 +1,13 @@
+{"trace_id":"pair_1","job_trace_id":"job_1","resume_trace_id":"res_1","fit_level":"Excellent","template_style":"formal_corporate","judge_score":null,"generated_at":"2026-07-29T00:28:42.407275+00:00"}
+{"trace_id":"pair_2","job_trace_id":"job_1","resume_trace_id":"res_2","fit_level":"Good","template_style":"casual_startup_friendly","judge_score":null,"generated_at":"2026-07-29T00:28:42.407275+00:00"}
+{"trace_id":"pair_3","job_trace_id":"job_1","resume_trace_id":"res_3","fit_level":"Partial","template_style":"tech_detail_heavy","judge_score":null,"generated_at":"2026-07-29T00:28:42.407275+00:00"}
+{"trace_id":"pair_6","job_trace_id":"job_2","resume_trace_id":"res_6","fit_level":"Good","template_style":"formal_corporate","judge_score":null,"generated_at":"2026-07-29T00:29:56.331038+00:00"}
+{"trace_id":"pair_7","job_trace_id":"job_2","resume_trace_id":"res_7","fit_level":"Partial","template_style":"casual_startup_friendly","judge_score":null,"generated_at":"2026-07-29T00:29:56.331038+00:00"}
+{"trace_id":"pair_8","job_trace_id":"job_2","resume_trace_id":"res_8","fit_level":"Poor","template_style":"tech_detail_heavy","judge_score":null,"generated_at":"2026-07-29T00:29:56.331038+00:00"}
+{"trace_id":"pair_9","job_trace_id":"job_2","resume_trace_id":"res_9","fit_level":"Excellent","template_style":"achievement_focused_metrics","judge_score":null,"generated_at":"2026-07-29T00:31:17.637234+00:00"}
+{"trace_id":"pair_10","job_trace_id":"job_2","resume_trace_id":"res_10","fit_level":"Good","template_style":"career_changer_xfer_skills","judge_score":null,"generated_at":"2026-07-29T00:31:17.637234+00:00"}
+{"trace_id":"pair_11","job_trace_id":"job_3","resume_trace_id":"res_11","fit_level":"Partial","template_style":"formal_corporate","judge_score":null,"generated_at":"2026-07-29T00:32:11.374981+00:00"}
+{"trace_id":"pair_12","job_trace_id":"job_3","resume_trace_id":"res_12","fit_level":"Poor","template_style":"casual_startup_friendly","judge_score":null,"generated_at":"2026-07-29T00:32:11.374981+00:00"}
+{"trace_id":"pair_13","job_trace_id":"job_3","resume_trace_id":"res_13","fit_level":"Excellent","template_style":"tech_detail_heavy","judge_score":null,"generated_at":"2026-07-29T00:32:11.374981+00:00"}
+{"trace_id":"pair_14","job_trace_id":"job_3","resume_trace_id":"res_14","fit_level":"Good","template_style":"achievement_focused_metrics","judge_score":null,"generated_at":"2026-07-29T00:33:41.040402+00:00"}
+{"trace_id":"pair_15","job_trace_id":"job_3","resume_trace_id":"res_15","fit_level":"Partial","template_style":"career_changer_xfer_skills","judge_score":null,"generated_at":"2026-07-29T00:33:41.040402+00:00"}

@@ -1,0 +1,7 @@
+{
+  "name": "achievement_focused_metrics",
+  "display_name": "Achievement Focused (Metrics Driven)",
+  "writing_style": "Results-oriented with quantified impact statements leading every bullet point",
+  "persona": "A high-performer who measures everything. Every role produced concrete, defensible outcomes. Numbers are not just decoration — they are the story.",
+  "instructions": "Every bullet point MUST include a quantified outcome: percentage improvement, dollar impact, time saved, user count, revenue generated, or cost reduced. Lead with the result, then the action that caused it. Example patterns: 'Reduced customer churn 23% by implementing proactive outreach to 1,200+ accounts quarterly.' / 'Generated $2.4M in new ARR by redesigning the enterprise sales motion across 3 verticals.' / 'Cut CI pipeline runtime from 42 min to 8 min by parallelizing test suites across 12 worker nodes.' If an exact number is not realistic, use a plausible estimate with a qualifier ('~', 'approximately', 'over'). The summary should also open with a bold outcome statement. Avoid vague verbs like 'helped', 'assisted', 'worked on' — replace with owned, drove, delivered, generated, reduced."
+}

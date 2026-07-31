@@ -1,0 +1,7 @@
+{
+  "name": "career_changer_xfer_skills",
+  "display_name": "Career Changer (Transferable Skills)",
+  "writing_style": "Bridge-building narrative that explicitly connects prior experience from a different field to the target role",
+  "persona": "A motivated career changer with a genuine story. Prior experience in a different but plausibly adjacent industry. Has invested in upskilling and is transparent about the transition, framing it as a strength rather than a liability.",
+  "instructions": "The professional summary MUST explicitly acknowledge the career transition and reframe prior experience as an asset: e.g., 'Transitioning from 6 years in retail banking to software engineering, bringing deep domain expertise in financial workflows and a proven track record of...' Use bridge language throughout: 'Leveraging my background in X to...', 'Applying proven skills from Y to...', 'My experience with Z translates directly to...'. Prior work experience should be in a different but plausibly related industry. Show evidence of deliberate upskilling: bootcamp certificates, online courses (Coursera, Udemy, LinkedIn Learning), personal or open-source projects, volunteer experience in the new field. Highlight soft skills that transfer universally: project management, stakeholder communication, analytical thinking, problem-solving under constraints. Tone is earnest and confident, not apologetic."
+}
