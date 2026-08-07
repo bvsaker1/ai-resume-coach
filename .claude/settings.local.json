@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"import ast; ast.parse\\(open\\('resume_generator.py'\\).read\\(\\)\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('resume_generator.py'\\).read\\(\\)\\)\")",
+      "Bash(file ../data/visualizations/*.png)"
     ]
   }
 }

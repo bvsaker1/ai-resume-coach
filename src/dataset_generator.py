@@ -19,6 +19,7 @@ Logs (logs/ directory):
 
 import argparse
 import json
+import re
 import time
 import uuid
 import traceback
@@ -68,10 +69,27 @@ NUM_JOBS: int = int(os.getenv("NUM_JOBS", "50"))
 NUM_RESUMES_PER_JOB: int = int(os.getenv("NUM_RESUMES_PER_JOB", "5"))
 JOB_MAX_COMPLETION_TOKENS: int = int(os.getenv("JOB_MAX_COMPLETION_TOKENS", "2200"))
 RESUME_MAX_COMPLETION_TOKENS: int = int(os.getenv("RESUME_MAX_COMPLETION_TOKENS", "3000"))
+JUDGE_MAX_COMPLETION_TOKENS: int = int(os.getenv("JUDGE_MAX_COMPLETION_TOKENS", "4000"))
+
+# Per-call network timeout (seconds) for every client.chat.completions.create()
+# call in this codebase. None of the underlying SDKs time out on their own in
+# any reasonable window (openai-python defaults to 600s) — this is what
+# actually bounds worst-case latency, independent of max_completion_tokens.
+LLM_REQUEST_TIMEOUT_SECONDS: float = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "45"))
+
+# A run only aborts once this many FATAL LLM/API errors happen in a row, with no
+# successful batch in between — an isolated flaky batch (e.g. the model garbling
+# a single response) no longer kills a whole run, but a genuine persistent
+# problem (real rate-limit/auth failure that keeps recurring) still does.
+MAX_CONSECUTIVE_FATAL_FAILURES: int = int(os.getenv("MAX_CONSECUTIVE_FATAL_FAILURES", "3"))
 ITERATION: int = int(os.getenv("ITERATION", "1"))
 RATE_LIMIT_TPM: int = int(os.getenv("RATE_LIMIT_TPM", "5000"))
 JOB_MAX_BATCH_SIZE: int = int(os.getenv("JOB_MAX_BATCH_SIZE", "5"))
 RESUME_MAX_BATCH_SIZE: int = int(os.getenv("RESUME_MAX_BATCH_SIZE", "2"))
+
+# Total LLM calls (initial + top-ups) allowed per requested batch when the LLM
+# returns fewer items than asked for — see generate_jobs_batch / _generate_resumes_batch.
+MAX_BATCH_TOPUP_ATTEMPTS: int = 3
 
 INDUSTRIES: list[str] = [
     "Information Technology & Software",
@@ -117,8 +135,10 @@ class RateLimiter:
         """
         Check if adding estimated_tokens would exceed the TPM limit.
         Loops and sleeps until enough of the 60s window has cleared to fit the request.
-        If the request alone exceeds the limit (e.g. large batch), waits for a full
-        60s window to clear before proceeding.
+        If the request alone exceeds the limit (e.g. large batch), waits for any
+        currently-tracked usage to clear, then proceeds anyway — no amount of
+        waiting can ever bring a single over-budget request under budget, so
+        looping forever on that check would hang indefinitely.
         """
         while True:
             now = time.time()
@@ -133,6 +153,15 @@ class RateLimiter:
             # Check if we have budget for this request
             if tokens_last_60s + estimated_tokens <= self.tpm_limit:
                 # Budget available — record and proceed
+                self.requests.append((time.time(), estimated_tokens))
+                return
+
+            # This single request alone exceeds the whole budget: once there's no
+            # other tracked usage left to wait out, further waiting is pointless
+            # (estimated_tokens alone will never fit under tpm_limit) — proceed.
+            if estimated_tokens > self.tpm_limit and not self.requests:
+                print(f"⚠️  Rate limit: this request needs ~{estimated_tokens} tokens, which alone "
+                      f"exceeds the {self.tpm_limit} TPM budget. Proceeding without waiting further.")
                 self.requests.append((time.time(), estimated_tokens))
                 return
 
@@ -162,6 +191,27 @@ class RateLimiter:
 
 # Init global rate limiter
 _rate_limiter = RateLimiter(RATE_LIMIT_TPM)
+
+
+class ConsecutiveFailureTracker:
+    """Tracks consecutive fatal LLM/API failures across an entire run — shared
+    between job-batch and resume-batch call sites in process_industry, and
+    NOT reset per industry, so a persistent problem straddling an industry
+    boundary is still caught. Any successful batch (job or resume) resets the
+    streak to 0; a non-fatal failure leaves it unchanged (it's a different
+    signal, doesn't count either way)."""
+
+    def __init__(self, threshold: int) -> None:
+        self.threshold = threshold
+        self.streak = 0
+
+    def record_failure(self) -> bool:
+        """Returns True if the run should now abort (streak reached threshold)."""
+        self.streak += 1
+        return self.streak >= self.threshold
+
+    def record_success(self) -> None:
+        self.streak = 0
 
 
 # ── Logger ────────────────────────────────────────────────────────────────────
@@ -233,6 +283,11 @@ class Logger:
         self._write("llm_batch_incomplete", context=context, trace_id=trace_id,
                     expected=expected, actual=actual, missing=expected - actual)
 
+    def fatal_error_tolerated(self, context: str, streak: int, threshold: int) -> None:
+        """Log a fatal-classified LLM/API error that did NOT abort the run because
+        the consecutive-failure streak hadn't reached the threshold yet."""
+        self._write("llm_fatal_error_tolerated", context=context, streak=streak, threshold=threshold)
+
     def run_complete(self, total_jobs: int, total_resumes: int,
                      jobs_path: str, resumes_path: str, pairs_path: str) -> None:
         self._write("run_complete", total_jobs=total_jobs, total_resumes=total_resumes,
@@ -291,8 +346,11 @@ def load_templates() -> dict[str, dict]:
 
 # ── Instructor Client ─────────────────────────────────────────────────────────
 
-def make_client() -> instructor.Instructor:
-    if "/" in GENERATION_MODEL:
+def make_client(model: str = GENERATION_MODEL) -> instructor.Instructor:
+    """Build an instructor client for `model`. Provider is picked per-model
+    (not globally) so callers can request a client for JUDGE_MODEL, which may
+    be on a different provider than GENERATION_MODEL."""
+    if "/" in model:
         if not OPENROUTER_API_KEY:
             raise RuntimeError(
                 "OPENROUTER_API_KEY is not set. Add it to your environment or .env file."
@@ -449,7 +507,8 @@ def generate_jobs_batch(
     logger: "Logger",
 ) -> tuple[list[JobPosting], list[tuple[dict, dict]]]:
     """
-    Generate multiple job postings in a single LLM call.
+    Generate multiple job postings, retrying immediately with a smaller
+    top-up batch for any slots the LLM doesn't return on the first attempt.
 
     Args:
         client: Instructor client for LLM calls
@@ -465,33 +524,44 @@ def generate_jobs_batch(
     batch_size = len(experience_levels)
     now = datetime.now(UTC).isoformat()
 
-    prompt = build_jobs_batch_prompt(industry, experience_levels)
+    # Keep whatever the LLM already generated and only ask again for the
+    # still-missing count, rather than accepting a short batch outright.
+    collected_raw_jobs: list[dict] = []
+    remaining_levels = experience_levels
+    for attempt in range(1, MAX_BATCH_TOPUP_ATTEMPTS + 1):
+        prompt = build_jobs_batch_prompt(industry, remaining_levels)
 
-    # max_completion_tokens is a shared budget for the entire batch response (not per-job)
-    estimated_tokens = len(prompt) // 4 + max_completion_tokens
-    _rate_limiter.wait_if_needed(estimated_tokens)
+        # max_completion_tokens is a shared budget for the entire batch response (not per-job)
+        estimated_tokens = len(prompt) // 4 + max_completion_tokens
+        _rate_limiter.wait_if_needed(estimated_tokens)
 
-    # Call LLM to generate batch
-    batch_response: RawJobBatch = client.chat.completions.create(
-        model=GENERATION_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        response_model=RawJobBatch,
-        max_retries=3,
-        max_completion_tokens=max_completion_tokens,
-    )
-
-    if len(batch_response.jobs) < batch_size:
-        logger.batch_incomplete(
-            context=f"jobs_batch_generation industry={industry!r}",
-            trace_id="N/A",
-            expected=batch_size,
-            actual=len(batch_response.jobs),
+        batch_response: RawJobBatch = client.chat.completions.create(
+            model=GENERATION_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_model=RawJobBatch,
+            max_retries=3,
+            max_completion_tokens=max_completion_tokens,
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         )
+
+        received = batch_response.jobs[: len(remaining_levels)]
+        if len(received) < len(remaining_levels):
+            logger.batch_incomplete(
+                context=f"jobs_batch_generation industry={industry!r} attempt={attempt}",
+                trace_id="N/A",
+                expected=len(remaining_levels),
+                actual=len(received),
+            )
+        collected_raw_jobs.extend(received)
+
+        if len(collected_raw_jobs) >= batch_size:
+            break
+        remaining_levels = experience_levels[len(collected_raw_jobs):]
 
     # Validate each raw job independently so invalid items can still be persisted.
     job_postings: list[JobPosting] = []
     invalid_jobs: list[tuple[dict, dict]] = []
-    for i, raw_job in enumerate(batch_response.jobs):
+    for i, raw_job in enumerate(collected_raw_jobs):
         job_number = job_counter_start + i
         trace_id = f"job_{job_number}"
         raw_record = dict(raw_job) if isinstance(raw_job, dict) else {"raw_content": raw_job}
@@ -504,26 +574,6 @@ def generate_jobs_batch(
             job_postings.append(job_posting)
         else:
             invalid_jobs.append((raw_record, error_details))
-
-    # Slots the LLM silently dropped from the batch response never reach the loop above.
-    for i in range(len(batch_response.jobs), batch_size):
-        job_number = job_counter_start + i
-        missing_trace_id = f"job_{job_number}"
-        raw_record = {
-            "trace_id": missing_trace_id,
-            "generated_at": now,
-            "experience_level": experience_levels[i],
-            "industry": industry,
-        }
-        error_details = {
-            "record_trace_id": missing_trace_id,
-            "stage": "job_generation",
-            "error_type": "llm_missing_job",
-            "validation_errors": [
-                {"msg": f"LLM returned {len(batch_response.jobs)} of {batch_size} requested jobs; this slot was never generated."}
-            ],
-        }
-        invalid_jobs.append((raw_record, error_details))
 
     return job_postings, invalid_jobs
 
@@ -573,6 +623,7 @@ This is resume #{resume_index_within_job + 1} for this job. Make it a unique, re
         response_model=ResumeContent,
         max_retries=3,
         max_completion_tokens=max_completion_tokens,
+        timeout=LLM_REQUEST_TIMEOUT_SECONDS,
     )
 
     return Resume(
@@ -647,6 +698,27 @@ def backup_iteration_outputs(iteration: int) -> None:
     ])
 
 
+def find_max_trace_id_counter(prefix: str, *paths: Path) -> int:
+    """Scan JSONL files for top-level 'trace_id' fields matching '{prefix}_N'
+    and return the max N found (0 if none / files missing). Used by
+    correction.py's newly-valid-job resume backfill and by --resume here."""
+    pattern = re.compile(rf'"trace_id"\s*:\s*"{re.escape(prefix)}_(\d+)"')
+    max_n = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        for match in pattern.finditer(path.read_text()):
+            max_n = max(max_n, int(match.group(1)))
+    return max_n
+
+
+def count_jsonl_lines(path: Path) -> int:
+    """Count non-blank lines in a JSONL file (0 if it doesn't exist)."""
+    if not path.exists():
+        return 0
+    return sum(1 for line in path.read_text().splitlines() if line.strip())
+
+
 def backup_correction_outputs(iteration: int) -> None:
     """Move existing correction outputs (the 5 files correction.py writes) into
     a single timestamped backup directory before overwriting them. Deliberately
@@ -683,6 +755,7 @@ def process_industry(
     job_counter_start: int,
     resume_counter_start: int,
     pair_counter_start: int,
+    failure_tracker: ConsecutiveFailureTracker,
 ) -> int:
     """
     Generate all jobs for one industry (in batches), then generate resumes for each job.
@@ -705,51 +778,84 @@ def process_industry(
     # ── Phase 1: Generate all jobs for this industry (in batches) ──────────────
     logger.industry_jobs_batch_start(industry=industry, job_count=jobs_per_industry)
 
-    # Split jobs into batches
-    num_batches = (jobs_per_industry + JOB_MAX_BATCH_SIZE - 1) // JOB_MAX_BATCH_SIZE  # ceiling division
-    for batch_idx in range(num_batches):
-        batch_start = batch_idx * JOB_MAX_BATCH_SIZE
-        batch_end = min(batch_start + JOB_MAX_BATCH_SIZE, jobs_per_industry)
-        batch_experience_levels = experience_levels[batch_start:batch_end]
-        batch_size = len(batch_experience_levels)
-
-        print(f"  [Batch {batch_idx + 1:2d}/{num_batches}] Generating {batch_size} jobs...", end=" ", flush=True)
-        
+    def _attempt_job_batch(batch_levels: list[str], next_id: int, label: str) -> Optional[tuple[list, list]]:
+        """One attempt at generating a batch of jobs. Returns (valid_jobs,
+        invalid_jobs) — writing them out — for any call that didn't raise
+        (even if it under-delivered). Returns None if the call raised a
+        fatal-but-tolerated error (caller decides whether to retry/defer).
+        Raises if this failure pushed the run past the abort threshold."""
+        nonlocal last_job_generation_error
+        print(f"  [{label}] Generating {len(batch_levels)} jobs...", end=" ", flush=True)
         try:
             batch_jobs, batch_invalid_jobs = generate_jobs_batch(
                 client=client,
                 industry=industry,
-                experience_levels=batch_experience_levels,
-                batch_start_index=batch_start,
-                job_counter_start=job_counter_start + batch_start,
+                experience_levels=batch_levels,
+                batch_start_index=0,
+                job_counter_start=next_id,
                 max_completion_tokens=job_max_completion_tokens,
                 logger=logger,
             )
-
-            # Write all jobs in batch and collect them
             for job in batch_jobs:
                 append_jsonl(jobs_file, job)
                 append_jsonl(jobs_valid_file, job)
-                jobs.append(job)
-
             for raw_job, error_details in batch_invalid_jobs:
                 append_invalid_with_error(jobs_file, raw_job, error_details)
                 append_invalid_with_error(jobs_invalid_file, raw_job, error_details)
-                invalid_jobs_count += 1
-            
             print(f"OK  ({len(batch_jobs)} jobs)")
-            
+            failure_tracker.record_success()
+            return batch_jobs, batch_invalid_jobs
         except Exception as exc:
             last_job_generation_error = exc
             print(f"ERR  {exc}")
-            logger.llm_error(
-                context=f"jobs_batch_generation industry={industry!r} batch={batch_idx} size={batch_size}",
-                trace_id="N/A",
-                error_message=str(exc),
-                error=exc,
-            )
+            context = f"jobs_batch_generation industry={industry!r} {label} size={len(batch_levels)}"
+            logger.llm_error(context=context, trace_id="N/A", error_message=str(exc), error=exc)
             if is_fatal_llm_error(exc):
-                raise
+                if failure_tracker.record_failure():
+                    raise
+                logger.fatal_error_tolerated(context, failure_tracker.streak, failure_tracker.threshold)
+                print(f"  ⚠️  Fatal-classified error tolerated ({failure_tracker.streak}/{failure_tracker.threshold} consecutive).")
+            return None
+
+    # Split jobs into batches. On a tolerated fatal failure, retry the same
+    # batch once immediately; if that also fails, defer it to a final
+    # make-up pass (after every batch has had its normal turn) rather than
+    # losing those job slots outright — see _attempt_job_batch.
+    next_job_id = job_counter_start
+    num_batches = (jobs_per_industry + JOB_MAX_BATCH_SIZE - 1) // JOB_MAX_BATCH_SIZE  # ceiling division
+    pending_levels: list[str] = []
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * JOB_MAX_BATCH_SIZE
+        batch_end = min(batch_start + JOB_MAX_BATCH_SIZE, jobs_per_industry)
+        batch_levels = experience_levels[batch_start:batch_end]
+        label = f"Batch {batch_idx + 1:2d}/{num_batches}"
+
+        result = _attempt_job_batch(batch_levels, next_job_id, label)
+        if result is None:
+            print(f"      Retrying {label.lower()}...", end=" ", flush=True)
+            result = _attempt_job_batch(batch_levels, next_job_id, f"{label} retry")
+
+        if result is None:
+            pending_levels.extend(batch_levels)
+            continue
+
+        batch_jobs, batch_invalid_jobs = result
+        jobs.extend(batch_jobs)
+        invalid_jobs_count += len(batch_invalid_jobs)
+        next_job_id += len(batch_jobs) + len(batch_invalid_jobs)
+
+    if pending_levels:
+        print(f"\n  Attempting to make up {len(pending_levels)} job(s) that failed earlier...")
+        for i in range(0, len(pending_levels), JOB_MAX_BATCH_SIZE):
+            chunk = pending_levels[i:i + JOB_MAX_BATCH_SIZE]
+            result = _attempt_job_batch(chunk, next_job_id, "Make-up batch")
+            if result is None:
+                print(f"  ⚠️  Still could not generate {len(chunk)} job(s) after retries; accepting the shortfall.")
+                continue
+            batch_jobs, batch_invalid_jobs = result
+            jobs.extend(batch_jobs)
+            invalid_jobs_count += len(batch_invalid_jobs)
+            next_job_id += len(batch_jobs) + len(batch_invalid_jobs)
 
     if not jobs:
         print(f"\n  ❌ No jobs were successfully generated for {industry}. Skipping resume generation.")
@@ -782,12 +888,17 @@ def process_industry(
 
     # ── Phase 2: Generate resumes for each job ────────────────────────────────
     resumes_generated = 0
-    for job_i, job in enumerate(jobs):
-        print(f"\n  Job {job_i + 1}/{len(jobs)}: {job.job_title}")
-        fit_levels = [get_fit_level(global_resume_offset + job_i * resumes_per_job + r) for r in range(resumes_per_job)]
 
+    def _attempt_resumes_for_job(job_i: int, job: JobPosting, label: str) -> bool:
+        """One attempt at generating resumes for one job. Returns True on
+        success (writes happen internally). Returns False if it failed with a
+        fatal-but-tolerated error (caller decides whether to retry/defer).
+        Raises for a genuine abort (streak hit threshold) or a non-fatal
+        error (caller abandons remaining jobs in this industry, unchanged
+        from before)."""
+        nonlocal resumes_generated
+        fit_levels = [get_fit_level(global_resume_offset + job_i * resumes_per_job + r) for r in range(resumes_per_job)]
         try:
-            # Call separate resume generator (abort-on-failure for this job)
             resume_pairs, invalid_resumes = generate_resumes_for_job(
                 client=client,
                 logger=logger,
@@ -799,34 +910,69 @@ def process_industry(
                 pair_counter_start=pair_counter_start + job_i * resumes_per_job,
                 max_completion_tokens=resume_max_completion_tokens,
             )
-
-            # Write all resumes and pairs for this job
             for resume, pair in resume_pairs:
                 append_jsonl(resumes_file, resume)
                 append_jsonl(resumes_valid_file, resume)
                 append_jsonl(pairs_file, pair)
                 resumes_generated += 1
-
             for raw_resume, error_details in invalid_resumes:
                 append_invalid_with_error(resumes_file, raw_resume, error_details)
                 append_invalid_with_error(resumes_invalid_file, raw_resume, error_details)
-
+            failure_tracker.record_success()
+            return True
         except Exception as exc:
-            # Resume generation failed for this job; halt and log
             error_msg = str(exc)
-            print(f"\n  ❌ Resume generation failed for job '{job.job_title}' (job_trace_id={job.trace_id}).")
-            print(f"     Halting further resume generation due to error: {error_msg[:100]}")
+            print(f"\n  ❌ Resume generation failed for job '{job.job_title}' (job_trace_id={job.trace_id}) [{label}].")
+            context = f"resume_batch_generation job_trace_id={job.trace_id!r} title={job.job_title!r}"
             logger.llm_error(
-                context=f"resume_batch_generation job_trace_id={job.trace_id!r} title={job.job_title!r}",
+                context=context,
                 trace_id="N/A",
-                error_message=f"Batch resume generation failed; halting: {error_msg[:200]}",
+                error_message=f"Batch resume generation failed: {error_msg[:200]}",
                 error=exc,
             )
             if is_fatal_llm_error(exc):
-                raise
-            # Return early; do not process remaining jobs
+                if failure_tracker.record_failure():
+                    print(f"     Halting further resume generation due to error: {error_msg[:100]}")
+                    raise
+                logger.fatal_error_tolerated(context, failure_tracker.streak, failure_tracker.threshold)
+                print(f"     Fatal-classified error tolerated ({failure_tracker.streak}/{failure_tracker.threshold} consecutive).")
+                return False
+            # Non-fatal: caller abandons remaining jobs in this industry (existing behavior).
+            print(f"     Halting further resume generation due to error: {error_msg[:100]}")
+            raise
+
+    # On a tolerated fatal failure, retry the same job once immediately; if
+    # that also fails, defer it to a final make-up pass (after every job has
+    # had its normal turn) instead of losing that job's resumes outright.
+    jobs_needing_retry: list[tuple[int, JobPosting]] = []
+    for job_i, job in enumerate(jobs):
+        print(f"\n  Job {job_i + 1}/{len(jobs)}: {job.job_title}")
+        try:
+            ok = _attempt_resumes_for_job(job_i, job, "attempt 1")
+            if not ok:
+                print(f"     Retrying job '{job.job_title}'...")
+                ok = _attempt_resumes_for_job(job_i, job, "retry")
+            if not ok:
+                print(f"     Deferring job '{job.job_title}' to a final make-up pass.")
+                jobs_needing_retry.append((job_i, job))
+        except Exception:
+            # Fatal (streak hit threshold) already re-raises past this point.
+            # Non-fatal: abandon remaining jobs in this industry, as before.
             print(f"\n⚠️  Skipped {len(jobs) - job_i - 1} remaining jobs in {industry}.\n")
             break
+
+    if jobs_needing_retry:
+        print(f"\n  Attempting to make up resumes for {len(jobs_needing_retry)} job(s) that failed earlier...")
+        for job_i, job in jobs_needing_retry:
+            try:
+                ok = _attempt_resumes_for_job(job_i, job, "make-up")
+                if not ok:
+                    print(f"  ⚠️  Still could not generate resumes for job '{job.job_title}' after retries; "
+                          f"accepting the shortfall (0 resumes for this job).")
+            except Exception as exc:
+                if is_fatal_llm_error(exc):
+                    raise
+                print(f"  ⚠️  Non-fatal error during make-up for job '{job.job_title}': {exc}")
 
     return resumes_generated
 
@@ -879,6 +1025,16 @@ def main() -> None:
         default=ITERATION,
         help=f"Iteration number used in log filename (default: {ITERATION} from .env)",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Append to existing outputs for --iteration instead of overwriting: skips the "
+             "backup-and-truncate step, opens all files in append mode, and continues "
+             "job/resume/pair trace-ID numbering from the current max found in the existing "
+             "files. Use this to run industries one at a time (e.g. --industry X, then "
+             "--resume --industry Y) or to continue after an aborted run without losing or "
+             "renumbering prior output.",
+    )
     args = parser.parse_args()
 
     # Determine which industries to run
@@ -921,11 +1077,42 @@ def main() -> None:
     resumes_invalid_path = DATA_DIR / f"resumes_invalid_{args.iteration}.jsonl"
     log_path = LOGS_DIR / f"dataset_log_{args.iteration}.jsonl"
 
-    backup_iteration_outputs(args.iteration)
+    if args.resume:
+        # Combined files carry every attempted slot (valid + invalid), so scanning
+        # them for the current max trace ID avoids reissuing an ID already used by
+        # an invalid attempt. Pairs only ever exist for valid resumes, so pairs_path
+        # alone is authoritative there.
+        job_counter = find_max_trace_id_counter("job", jobs_path) + 1
+        resume_counter = find_max_trace_id_counter("res", resumes_path) + 1
+        pair_counter = find_max_trace_id_counter("pair", pairs_path) + 1
+        global_resume_offset = count_jsonl_lines(resumes_valid_path)
+    else:
+        backup_iteration_outputs(args.iteration)
+        job_counter = 1
+        resume_counter = 1
+        pair_counter = 1
+        global_resume_offset = 0
+
+    # One tracker for the whole run, shared across every industry — see
+    # ConsecutiveFailureTracker's docstring for why it isn't reset per industry.
+    failure_tracker = ConsecutiveFailureTracker(MAX_CONSECUTIVE_FATAL_FAILURES)
+
+    # Snapshot before this invocation writes anything, so the final summary can
+    # report both "this run added N" and "file now has M total" from the actual
+    # file contents — not from job_counter/resume_counter/pair_counter, which only
+    # advance after a FULLY completed industry and would under-report if a fatal
+    # error aborts partway through one (process_industry still writes each job/
+    # resume to disk as it goes, right up until the failure).
+    jobs_before = count_jsonl_lines(jobs_path)
+    resumes_before = count_jsonl_lines(resumes_path)
+    pairs_before = count_jsonl_lines(pairs_path)
 
     print("Dataset Generator")
     print(f"{'─' * 50}")
     print(f"  Iteration      : {args.iteration}")
+    if args.resume:
+        print(f"  Mode           : RESUME — appending, starting at job_{job_counter}/"
+              f"res_{resume_counter}/pair_{pair_counter} ({global_resume_offset} valid resumes so far)")
     print(f"  Industries     : {industries_to_run}")
     print(f"  Jobs total     : {args.num_jobs}")
     print(f"  Jobs plan      : {dict(zip(industries_to_run, jobs_per_industry_plan, strict=False))}")
@@ -950,19 +1137,16 @@ def main() -> None:
     total_resumes = 0
     aborted = False
 
+    file_mode = "a" if args.resume else "w"
     with (
-        open(jobs_path, "w") as jf,
-        open(jobs_valid_path, "w") as jvf,
-        open(jobs_invalid_path, "w") as jif,
-        open(resumes_path, "w") as rf,
-        open(resumes_valid_path, "w") as rvf,
-        open(resumes_invalid_path, "w") as rif,
-        open(pairs_path, "w") as pf,
+        open(jobs_path, file_mode) as jf,
+        open(jobs_valid_path, file_mode) as jvf,
+        open(jobs_invalid_path, file_mode) as jif,
+        open(resumes_path, file_mode) as rf,
+        open(resumes_valid_path, file_mode) as rvf,
+        open(resumes_invalid_path, file_mode) as rif,
+        open(pairs_path, file_mode) as pf,
     ):
-        job_counter = 1
-        resume_counter = 1
-        pair_counter = 1
-        global_resume_offset = 0
         for industry, jobs_for_industry in zip(industries_to_run, jobs_per_industry_plan, strict=False):
             try:
                 n_resumes = process_industry(
@@ -985,6 +1169,7 @@ def main() -> None:
                     job_counter_start=job_counter,
                     resume_counter_start=resume_counter,
                     pair_counter_start=pair_counter,
+                    failure_tracker=failure_tracker,
                 )
             except Exception as exc:
                 aborted = True
@@ -1012,11 +1197,17 @@ def main() -> None:
         )
     logger.close()
 
+    jobs_after = count_jsonl_lines(jobs_path)
+    resumes_after = count_jsonl_lines(resumes_path)
+    pairs_after = count_jsonl_lines(pairs_path)
+
     print(f"\n{'=' * 60}")
     print(f"  {'Aborted — partial results below' if aborted else 'Complete!'}")
-    print(f"  Jobs written    : {jobs_path} ({total_jobs} records)")
-    print(f"  Resumes written : {resumes_path} ({total_resumes} records)")
-    print(f"  Pairs written   : {pairs_path} ({total_resumes} records)")
+    print(f"  (This run added {jobs_after - jobs_before} job(s), {resumes_after - resumes_before} resume(s) "
+          f"before {'aborting' if aborted else 'finishing'}.)")
+    print(f"  Jobs written    : {jobs_path} ({jobs_after} records total)")
+    print(f"  Resumes written : {resumes_path} ({resumes_after} records total)")
+    print(f"  Pairs written   : {pairs_path} ({pairs_after} records total)")
     print(f"  Jobs valid      : {jobs_valid_path}")
     print(f"  Jobs invalid    : {jobs_invalid_path}")
     print(f"  Resumes valid   : {resumes_valid_path}")

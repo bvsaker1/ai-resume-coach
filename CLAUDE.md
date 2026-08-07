@@ -70,19 +70,55 @@ python pipeline.py --num-jobs 50 --generate-resumes-for-corrected-jobs
 
 If generation fails or aborts fatally, the pipeline exits with that same code and skips correction.
 
+### Analyzing match quality
+
+`src/analysis.py` is a rule-based judge by default (no LLM calls) — also a separate, manual step, never invoked by the other three scripts. It fills the gap left by `judge_pair()` (stub, always returns `None`/`judge_score` stays `null`):
+
+```bash
+cd src
+python analysis.py --iteration 1
+python analysis.py --iteration 1 --skills-overlap-threshold 0.3
+python analysis.py --iteration 1 --skip-charts
+python analysis.py --iteration 1 --llm-judge          # also judge every pair via JUDGE_MODEL
+```
+
+Scores every pair against 6 criteria and writes `data/failure_labels_{iteration}.jsonl`
+plus 6 `.png` charts to `data/visualizations/`. `--llm-judge` additionally runs the
+identical 6 rules through `JUDGE_MODEL` (prose-ified into the prompt, not "is this a
+good fit?") and writes `data/failure_labels_llm_{iteration}.jsonl` (`labeler: "llm_judge"`).
+See **Match analysis** below for the exact rules and the required-skills-only decision.
+
+### Running the review API
+
+`src/api.py` is a FastAPI service exposing the same scoring functions (`score_pair()`/
+`run_llm_judgment()`, imported directly from `analysis.py` — no duplicated rules) over
+HTTP. Never invoked by the other scripts either.
+
+```bash
+cd src
+uvicorn api:app --reload --port 8000
+# or: python api.py
+```
+
+`POST /review-resume` (`use_llm_judge` defaults to `false`), `GET /health`,
+`GET /analysis/failure-rates?iteration=N&labeler=judge|llm_judge` (serves an
+already-computed `failure_labels*` file — 404s if `analysis.py` hasn't been run for
+that iteration yet). See **API service** below for request/response shapes.
+
 There is no test suite (`src/test.py` is a standalone script that lists available Groq models via `client.models.list()`, not a pytest test — despite `pytest`/`pytest-mock` being in `requirements.txt`).
 
 ## Configuration (`.env`)
 
-- `GROQ_API_KEY` — used when `GENERATION_MODEL`/`JUDGE_MODEL` has no `/` (Groq-native model ID, e.g. `llama-3.3-70b-versatile`).
-- `OPENROUTER_API_KEY` — used when the model string contains `/` (OpenRouter slug, e.g. `qwen/qwen3-32b`). `make_client()` in `dataset_generator.py` picks the provider based on this alone.
-- `GENERATION_MODEL`, `JUDGE_MODEL` — `JUDGE_MODEL` is currently unused; `judge_pair()` is a stub that always returns `None` and `judge_score` in every pair is always `null`.
-- `NUM_JOBS`, `NUM_RESUMES_PER_JOB`, `JOB_MAX_COMPLETION_TOKENS`, `RESUME_MAX_COMPLETION_TOKENS` — defaults, overridable via CLI flags.
-- `ITERATION`, `RATE_LIMIT_TPM`, `JOB_MAX_BATCH_SIZE`, `RESUME_MAX_BATCH_SIZE` — iteration/output-file suffix, and batching/rate-limit tuning (Groq free-tier TPM defaults to 5000; batch sizes are small — 5 jobs/batch, 2 resumes/batch — to stay under it).
+- `GROQ_API_KEY` — used when a given model string has no `/` (Groq-native model ID, e.g. `llama-3.3-70b-versatile`).
+- `OPENROUTER_API_KEY` — used when the model string contains `/` (OpenRouter slug, e.g. `qwen/qwen3-32b`). `make_client(model=GENERATION_MODEL)` in `dataset_generator.py` picks the provider **per-model** (not globally), so it can also be called as `make_client(JUDGE_MODEL)` when `GENERATION_MODEL`/`JUDGE_MODEL` are on different providers.
+- `GENERATION_MODEL`, `JUDGE_MODEL` — `judge_pair()` in `dataset_generator.py` remains an unused stub (`judge_score` in every pair is always `null`), but `JUDGE_MODEL` itself is actively used by `analysis.py --llm-judge` and `api.py`'s `POST /review-resume` with `use_llm_judge: true` — both call it only when explicitly requested, never by default.
+- `NUM_JOBS`, `NUM_RESUMES_PER_JOB`, `JOB_MAX_COMPLETION_TOKENS`, `RESUME_MAX_COMPLETION_TOKENS`, `JUDGE_MAX_COMPLETION_TOKENS` — defaults, overridable via CLI flags. `JUDGE_MAX_COMPLETION_TOKENS` defaults to `4000` (not a small value like the label schema itself would need) because reasoning models (e.g. `gpt-oss-120b` via OpenRouter) spend most of the budget on hidden/visible reasoning tokens before the answer; too small a budget causes truncation, which forces expensive retries rather than actually saving time.
+- `LLM_REQUEST_TIMEOUT_SECONDS` (default `45`) — per-call `timeout=` passed to every `client.chat.completions.create(...)` call in the codebase (7 call sites across `dataset_generator.py`/`resume_generator.py`/`correction.py`/`analysis.py`). Added because none of the underlying SDKs impose a reasonable timeout on their own (openai-python defaults to 600s) — without this, a slow/looping call could hang indefinitely, which is unacceptable for `api.py`'s synchronous `POST /review-resume`. `analysis.py`'s `run_llm_judgment()` (the one call site an HTTP request waits on directly) additionally uses `max_retries=2` instead of the usual 3, bounding worst-case latency at `2 * LLM_REQUEST_TIMEOUT_SECONDS` rather than 3x.
+- `ITERATION`, `RATE_LIMIT_TPM`, `JOB_MAX_BATCH_SIZE`, `RESUME_MAX_BATCH_SIZE` — iteration/output-file suffix, and batching/rate-limit tuning (Groq free-tier TPM defaults to 5000; batch sizes are small — 5 jobs/batch, 2 resumes/batch — to stay under it). `RateLimiter.wait_if_needed()` (in `dataset_generator.py`) has a specific fix worth knowing about: if a *single* call's estimated tokens alone exceed `RATE_LIMIT_TPM` (easy to hit with a large `JUDGE_MAX_COMPLETION_TOKENS` against a modest TPM budget), the naive "wait until there's room" loop can never succeed — waiting doesn't shrink the request. It now detects that case and proceeds once any other tracked usage has cleared, instead of sleeping in an infinite loop (this was a real, reproducible hang before the fix).
 
 ## Architecture
 
-**Module layout**: `dataset_generator.py` (entry point, CLI, `process_industry`, `Logger`, `RateLimiter`, prompt builders, config) and `resume_generator.py` (`generate_resumes_for_job`, batch/single resume generation) are the generation pipeline. `validation.py` owns every Pydantic model (`JobContent`/`JobPosting`/`ResumeContent`/`Resume`/`ResumePair`/`RawJobBatch`/`RawResumeBatch`/etc.) plus the shared `validate_job()`/`validate_resume()` functions, so it has zero dependency on the other two — this is what lets both `dataset_generator.py` and `resume_generator.py` (and `correction.py`) import the same validation logic without a three-way circular import. `llm_errors.py` owns `is_fatal_llm_error()`, dependency-light so it's importable everywhere. `correction.py` and `pipeline.py` sit on top and import from the others, but nothing imports from them.
+**Module layout**: `dataset_generator.py` (entry point, CLI, `process_industry`, `Logger`, `RateLimiter`, prompt builders, config) and `resume_generator.py` (`generate_resumes_for_job`, batch/single resume generation) are the generation pipeline. `validation.py` owns every Pydantic model (`JobContent`/`JobPosting`/`ResumeContent`/`Resume`/`ResumePair`/`RawJobBatch`/`RawResumeBatch`/etc.) plus the shared `validate_job()`/`validate_resume()` functions, so it has zero dependency on the other two — this is what lets both `dataset_generator.py` and `resume_generator.py` (and `correction.py`) import the same validation logic without a three-way circular import. `llm_errors.py` owns `is_fatal_llm_error()`, dependency-light so it's importable everywhere. `correction.py`, `pipeline.py`, and `analysis.py` sit on top and import from the others, but nothing imports from them — except `api.py`, which sits one layer above `analysis.py` and imports its pair-scoring functions directly. Nothing imports from `api.py`.
 
 **Two-phase generation per industry** (`process_industry` in `dataset_generator.py`): first all job postings for an industry are generated in batches, then resumes are generated per job.
 - If job generation for an industry produces zero valid jobs, that industry is skipped entirely (0 resumes) — logged, not fatal.
@@ -103,6 +139,22 @@ Content-level problems never reach this classifier at all — they're handled en
 
 **Pipeline** (`pipeline.py`): chains generation then correction as two subprocesses (not in-process calls) against the same `--iteration`, so their module-level singletons (`RateLimiter`, open `Logger` file handles) never leak between stages. Propagates whichever stage's exit code is non-zero and skips correction if generation fails.
 
+**Match analysis** (`analysis.py`, never invoked automatically, no LLM calls): loads every pair (`pairs_{iteration}.jsonl` + `pairs_corrected_{iteration}.jsonl` if present) with the `JobPosting`/`Resume` they reference, and scores each against 6 criteria — `job_resume_match = 1` only if all 6 pass:
+- **Skills overlap** — `|normalized(job.requirements.required_skills) ∩ normalized(resume.skills)| / |normalized(required_skills)|` (`normalize_skill()`: lowercase → strip parentheticals/version tokens → strip punctuation → strip trailing plural `s`). Fails below `--skills-overlap-threshold` (default `0.5`). **Deliberately `required_skills` only — `preferred_skills` was tried and reverted**: jobs here average ~10.7 required+preferred skills combined vs. resumes averaging only ~4.6 skills listed, so overlap against the combined set made `low_skills_overlap` fail on almost every pair regardless of actual fit, collapsing the match rate toward 0% with no discriminative signal between fit levels.
+- **Experience mismatch** — total resume experience (`total_experience_years()`, summing all entries, `"Present"`/`None` resolved against the resume's own `generated_at` for reproducibility) `< job.requirements.experience_years / 2`, **or** `has_experience_gap()` finds any two sorted entries with a gap `>= 1` year.
+- **Seniority mismatch** — `infer_resume_level()` buckets total experience into the same bands `build_jobs_batch_prompt` uses for jobs (`<2→Entry`, `2–5→Mid`, `5–10→Senior`, `10–15→Lead/Principal`, `15+→Exec`; jobs never require the 5th "Exec" band, only resumes can land there) and diffs it against `JOB_LEVELS[job.requirements.experience_level]`. `level_mismatch` in the output is the **raw integer difference** (not binarized); it fails the pair when `> 1`.
+- **Missing core skills** — binary: any of `required_skills[:3]` absent from the resume.
+- **Hallucinated skills** — binary, any sub-check trips it: `<2yr` resume with `>=10` "Expert" skills; `>=30` skills where most are "Expert"; a hard-coded phrase (`"expert in all"`, `"certified in everything"`, etc.); or a timeline inconsistency (`has_overlapping_jobs()`, or `>1` entries with `end_date` in `(None, "Present")`).
+- **Awkward language** — binary: total occurrences of a jargon-phrase list (`"synergy"`, `"move the needle"`, `"circle back"`, etc.) across `summary` + all `responsibilities`/`achievements` exceeds `5`, or the same non-stopword appears `>=3` times in any 25-word sliding window.
+
+Writes `data/failure_labels_{iteration}.jsonl` (true JSONL, one object per line — not the wrapped-array shape sometimes used to *illustrate* a schema) with `trace_id`, `industry` (from `job.company.industry`), `labeler: "judge"`, `skills_overlap`, `level_mismatch`, and the 4 other binary flags. A second, richer in-memory `pandas.DataFrame` (same computation pass, extra columns `fit_level`/`template_style`/`is_niche_role`/inferred levels — never written to the label file) drives 6 matplotlib charts saved to `data/visualizations/`: a failure-mode correlation heatmap, failure rates grouped by fit level / template / niche-vs-standard, a schema-validation invalid-rate heatmap by industry (reuses `correction.load_jsonl_pairs()` on the `*_invalid_*` files — this one chart is about generation-time schema validity, not pair-match quality), and hallucination flags stacked by inferred resume seniority.
+
+**Scoring logic is split into pure functions specifically so `api.py` can reuse it**: `score_pair(job, resume, threshold) -> dict` holds everything `analyze_pair()` computes (the 6 rules), but takes no `ResumePair` and returns only the 7 scored fields — no `trace_id`/`industry`/`labeler`, which are identity metadata the caller attaches. `analyze_pair(job, resume, pair, threshold)` is now a thin wrapper: calls `score_pair()`, prepends `trace_id`/`industry`/`labeler: "judge"` from `pair`/`job`, and separately still returns `chart_context` (`fit_level`/`template_style` from `pair`, bulk-script-only). Same split for the LLM path: `run_llm_judgment(client, model, job, resume, threshold, max_completion_tokens) -> LLMJudgment` is the pure LLM call (`build_judge_prompt()` + `client.chat.completions.create()`); `llm_judge_pair(...)` wraps it the same way `analyze_pair` wraps `score_pair`. This was a pure extraction — confirmed the bulk CLI path's `failure_labels_{iteration}.jsonl` output is byte-for-byte unchanged after the split.
+
+**LLM judge** (`analysis.py --llm-judge` / `api.py`'s `use_llm_judge: true`, off by default in both): `build_judge_prompt(job, resume, threshold)` restates the exact same 6 rules as explicit prose instructions (thresholds, formulas, phrase lists spelled out verbatim) rather than asking the model's own notion of "good fit" — the point is evaluating the LLM against identical logic to the rule-based judge, not a different rubric. Response schema is `LLMJudgment` (a plain strict Pydantic model, not the loose-then-validate `RawJobBatch`/`RawResumeBatch` pattern generation uses — a single ad-hoc judgment doesn't need batch semantics). `run_llm_judgment()` is the only call site with `max_retries=2` (every other call site uses 3) and is the one call site an HTTP request waits on synchronously, so its worst-case latency is deliberately bounded tighter. In spot checks, the LLM judge's output on a given pair has matched the rule-based judge's almost exactly, which is the intended outcome of prompting from the same rules rather than a free-form rubric.
+
+**API service** (`api.py`, FastAPI, never invoked by the other scripts): `POST /review-resume` accepts `JobContent`/`ResumeContent` (the LLM-output-shaped schemas with no system metadata — FastAPI validates them automatically as the request body) and synthesizes the `JobPosting`/`Resume` metadata fields (`trace_id`, `generated_at`, and for resumes the unused-by-scoring `prompt_template`/`fit_level`/`writing_style` placeholders) before calling `score_pair()` or `run_llm_judgment()` directly — same functions, same rules, as `analysis.py`. The judge client is created lazily on first `use_llm_judge: true` request (module-level cache in `api.py`), not at import time, matching "off by default." `GET /analysis/failure-rates` doesn't compute anything — it reads whichever `failure_labels*_{iteration}.jsonl` `analysis.py` already wrote and 404s if that file doesn't exist yet, plus computes an aggregate `failure_rates` dict alongside the verbatim `labels` array.
+
 **Fit-level and template distribution is deterministic and cyclic, not random**:
 - `distribute_experience_levels(n)` cycles Entry → Mid → Senior → Lead/Principal across jobs in an industry.
 - `get_fit_level(global_resume_index)` cycles Excellent → Good → Partial → Poor across *all* resumes in the run (global index), so fit levels balance across the whole dataset, not per-job.
@@ -117,6 +169,7 @@ Content-level problems never reach this classifier at all — they're handled en
 - `data/jobs_{iteration}.jsonl`, `data/resumes_{iteration}.jsonl`, `data/pairs_{iteration}.jsonl` — combined generation outputs.
 - `data/{jobs,resumes}_valid_{iteration}.jsonl`, `data/{jobs,resumes}_invalid_{iteration}.jsonl` — split by validation outcome.
 - `data/{jobs,resumes}_corrected_{iteration}.jsonl`, `data/{jobs,resumes}_uncorrectable_{iteration}.jsonl`, `data/pairs_corrected_{iteration}.jsonl` — written only by `correction.py`. A full valid dataset is `jobs_valid_* + jobs_corrected_*` (same for resumes/pairs).
+- `data/failure_labels_{iteration}.jsonl` (`labeler: "judge"`), `data/failure_labels_llm_{iteration}.jsonl` (`labeler: "llm_judge"`, only with `--llm-judge`), `data/visualizations/*_{iteration}.png` — written only by `analysis.py`. `api.py` only ever *reads* `failure_labels*` files (`GET /analysis/failure-rates`); it never writes any of the per-iteration data files.
 - `logs/dataset_log_{iteration}.jsonl` — structured JSONL event log (`Logger` class), shared by both generation and correction (correction appends into the same file): run start/complete/aborted, batch starts, `llm_batch_incomplete`, classified LLM errors (`llm_error_rate_limit`, `llm_error_max_retries`, `llm_error_json_validation`, generic `llm_error`) each with full traceback, and correction events (`correction_run_start/complete`, `correction_attempt`, `correction_success`, `correction_failed`).
 - Re-running `dataset_generator.py` with the same `--iteration` **overwrites** prior outputs, but `backup_iteration_outputs()` first moves any existing *generation* files for that iteration into a timestamped folder under `data/backups/`. `correction.py` has its own analogous `backup_correction_outputs()` for its 5 files — deliberately separate, since correction *reads* the invalid files as input and must never have them moved out from under it by a shared backup call.
 - Trace IDs (`job_N`, `res_N`, `pair_N`) are assigned from global counters that advance by the *planned* slot count per industry, keeping IDs unique and stable even when generation partially fails mid-industry. Correction preserves these IDs rather than reissuing them.

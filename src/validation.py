@@ -357,7 +357,7 @@ def validate_job(raw_job: dict, trace_id: str, generated_at: str) -> tuple[Optio
             "record_trace_id": trace_id,
             "stage": "job_validation",
             "error_type": "pydantic_validation_error",
-            "validation_errors": exc.errors(),
+            "validation_errors": exc.errors(include_context=False),
         }
 
     job_posting = JobPosting(
@@ -386,7 +386,7 @@ def validate_resume(
             "record_trace_id": trace_id,
             "stage": "resume_validation",
             "error_type": "pydantic_validation_error",
-            "validation_errors": exc.errors(),
+            "validation_errors": exc.errors(include_context=False),
         }
 
     resume = Resume(

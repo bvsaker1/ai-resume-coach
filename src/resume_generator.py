@@ -204,7 +204,7 @@ def _generate_single_resume(
     Raises:
         Any exception from the LLM API (e.g., validation, rate limit, etc.)
     """
-    from dataset_generator import GENERATION_MODEL
+    from dataset_generator import GENERATION_MODEL, LLM_REQUEST_TIMEOUT_SECONDS
 
     now = datetime.now(UTC).isoformat()
     prompt = build_single_resume_prompt(job, template, fit_level, resume_index_within_job)
@@ -220,6 +220,7 @@ def _generate_single_resume(
         response_model=ResumeContent,
         max_retries=3,
         max_completion_tokens=max_completion_tokens,
+        timeout=LLM_REQUEST_TIMEOUT_SECONDS,
     )
 
     return Resume(
@@ -247,8 +248,10 @@ def _generate_resumes_batch(
     logger: "Logger",  # type: ignore
 ) -> tuple[list[Resume], list[tuple[dict, dict]]]:
     """
-    Generate multiple resumes in a single batch LLM call.
-    
+    Generate multiple resumes for one job, retrying immediately with a
+    smaller top-up batch for any slots the LLM doesn't return on the first
+    attempt (keeping whatever was already generated).
+
     Args:
         client: Groq instructor client
         job: JobPosting object with job details
@@ -258,34 +261,23 @@ def _generate_resumes_batch(
         resume_counter_start: Starting global resume counter for this batch
         max_completion_tokens: Token budget for the batch API call
         logger: Logger instance for event tracking
-    
+
     Returns:
         List of Resume objects
-    
+
     Raises:
         Exception from LLM API if generation fails
     """
-    from dataset_generator import GENERATION_MODEL, get_fit_level_brief, format_job_summary
+    from dataset_generator import (
+        GENERATION_MODEL, get_fit_level_brief, format_job_summary,
+        MAX_BATCH_TOPUP_ATTEMPTS, LLM_REQUEST_TIMEOUT_SECONDS, _rate_limiter,
+    )
 
     batch_size = len(batch_templates)
     now = datetime.now(UTC).isoformat()
-    trace_id = f"batch_{str(uuid.uuid4())[:8]}"
-    
-    # Build resume specs for the batch
-    resume_specs = []
-    for i, (template, fit_level) in enumerate(zip(batch_templates, batch_fit_levels)):
-        spec = (
-            f"Resume {i + 1}:\n"
-            f"  - Template: {template['display_name']} ({template['writing_style']} style)\n"
-            f"  - Fit Level: {fit_level}\n"
-        )
-        resume_specs.append(spec)
-    
-    specs_prompt = "\n".join(resume_specs)
-
     job_summary = format_job_summary(job)
 
-    # Build a compact fit legend plus short per-resume tags.
+    # Build a compact fit legend, reused across every attempt's prompt.
     fit_legend = (
         "Fit level legend:\n"
         "- Excellent: strong, highly aligned candidate.\n"
@@ -293,14 +285,21 @@ def _generate_resumes_batch(
         "- Partial: relevant but with clear gaps.\n"
         "- Poor: noticeably misaligned but still realistic."
     )
-    fit_tags = []
-    for i, fit_level in enumerate(batch_fit_levels):
-        fit_tags.append(f"Resume {i + 1}: {get_fit_level_brief(fit_level)}")
-    fit_tags_prompt = "\n".join(fit_tags)
-
     resume_schema_json = json.dumps(ResumeContent.model_json_schema(), indent=2)
 
-    prompt = f"""Generate exactly {batch_size} distinct, realistic resumes for the following job posting.
+    def build_prompt(templates: list[dict], fit_levels: list[str]) -> str:
+        size = len(templates)
+        resume_specs = [
+            f"Resume {i + 1}:\n"
+            f"  - Template: {template['display_name']} ({template['writing_style']} style)\n"
+            f"  - Fit Level: {fit_level}\n"
+            for i, (template, fit_level) in enumerate(zip(templates, fit_levels))
+        ]
+        specs_prompt = "\n".join(resume_specs)
+        fit_tags_prompt = "\n".join(
+            f"Resume {i + 1}: {get_fit_level_brief(fit_level)}" for i, fit_level in enumerate(fit_levels)
+        )
+        return f"""Generate exactly {size} distinct, realistic resumes for the following job posting.
 
 ═══ JOB CONTEXT ═══
 {job_summary}
@@ -327,48 +326,64 @@ Additional constraints not fully captured by the schema:
 - Include 2–4 work experience entries
 - Write a 2–4 sentence professional summary in the style of the template
 
-Generate {batch_size} unique resumes as a batch. Each resume should be a distinct, realistic individual."""
+Generate {size} unique resumes as a batch. Each resume should be a distinct, realistic individual."""
 
-    # Log batch start
-    for i, (template, fit_level) in enumerate(zip(batch_templates, batch_fit_levels)):
-        logger.resume_generation_start(
-            job_trace_id=job.trace_id,
-            job_title=job.job_title,
-            resume_index=batch_start_index + i,
-            fit_level=fit_level,
-            template=template["name"],
-            trace_id=trace_id,
+    # Keep whatever the LLM already generated and only ask again for the
+    # still-missing count, rather than accepting a short batch outright.
+    collected_raw_resumes: list[dict] = []
+    remaining_templates = batch_templates
+    remaining_fit_levels = batch_fit_levels
+    for attempt in range(1, MAX_BATCH_TOPUP_ATTEMPTS + 1):
+        attempt_size = len(remaining_templates)
+        attempt_trace_id = f"batch_{str(uuid.uuid4())[:8]}"
+
+        for i, (template, fit_level) in enumerate(zip(remaining_templates, remaining_fit_levels)):
+            logger.resume_generation_start(
+                job_trace_id=job.trace_id,
+                job_title=job.job_title,
+                resume_index=batch_start_index + len(collected_raw_resumes) + i,
+                fit_level=fit_level,
+                template=template["name"],
+                trace_id=attempt_trace_id,
+            )
+
+        prompt = build_prompt(remaining_templates, remaining_fit_levels)
+
+        # max_completion_tokens is a shared budget for the entire batch response (not per-resume)
+        estimated_tokens = len(prompt) // 4 + max_completion_tokens
+        _rate_limiter.wait_if_needed(estimated_tokens)
+
+        batch_response: RawResumeBatch = client.chat.completions.create(
+            model=GENERATION_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            response_model=RawResumeBatch,
+            max_retries=3,
+            max_completion_tokens=max_completion_tokens,
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         )
-    
-    # max_completion_tokens is a shared budget for the entire batch response (not per-resume)
-    from dataset_generator import _rate_limiter
-    estimated_tokens = len(prompt) // 4 + max_completion_tokens
-    _rate_limiter.wait_if_needed(estimated_tokens)
 
-    # Call LLM for batch generation
-    batch_response: RawResumeBatch = client.chat.completions.create(
-        model=GENERATION_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        response_model=RawResumeBatch,
-        max_retries=3,
-        max_completion_tokens=max_completion_tokens,
-    )
+        received = batch_response.resumes[:attempt_size]
+        if len(received) < attempt_size:
+            logger.batch_incomplete(
+                context=f"resumes_batch_generation job_trace_id={job.trace_id!r} title={job.job_title!r} attempt={attempt}",
+                trace_id=attempt_trace_id,
+                expected=attempt_size,
+                actual=len(received),
+            )
+        collected_raw_resumes.extend(received)
 
-    if len(batch_response.resumes) < batch_size:
-        logger.batch_incomplete(
-            context=f"resumes_batch_generation job_trace_id={job.trace_id!r} title={job.job_title!r}",
-            trace_id=trace_id,
-            expected=batch_size,
-            actual=len(batch_response.resumes),
-        )
+        if len(collected_raw_resumes) >= batch_size:
+            break
+        remaining_templates = batch_templates[len(collected_raw_resumes):]
+        remaining_fit_levels = batch_fit_levels[len(collected_raw_resumes):]
 
     # Validate each raw resume independently so invalid items are still persisted upstream.
     resumes: list[Resume] = []
     invalid_resumes: list[tuple[dict, dict]] = []
-    for i, raw_resume in enumerate(batch_response.resumes):
+    for i, raw_resume in enumerate(collected_raw_resumes):
         template = batch_templates[i]
         fit_level = batch_fit_levels[i]
-        
+
         resume_number = resume_counter_start + i
         trace_id = f"res_{resume_number}"
         raw_record = dict(raw_resume) if isinstance(raw_resume, dict) else {"raw_content": raw_resume}
@@ -384,27 +399,5 @@ Generate {batch_size} unique resumes as a batch. Each resume should be a distinc
             resumes.append(resume)
         else:
             invalid_resumes.append((raw_record, error_details))
-
-    # Slots the LLM silently dropped from the batch response never reach the loop above.
-    for i in range(len(batch_response.resumes), batch_size):
-        resume_number = resume_counter_start + i
-        missing_trace_id = f"res_{resume_number}"
-        raw_record = {
-            "trace_id": missing_trace_id,
-            "generated_at": now,
-            "fit_level": batch_fit_levels[i],
-            "template": batch_templates[i]["name"],
-            "job_trace_id": job.trace_id,
-            "job_title": job.job_title,
-        }
-        error_details = {
-            "record_trace_id": missing_trace_id,
-            "stage": "resume_generation",
-            "error_type": "llm_missing_resume",
-            "validation_errors": [
-                {"msg": f"LLM returned {len(batch_response.resumes)} of {batch_size} requested resumes; this slot was never generated."}
-            ],
-        }
-        invalid_resumes.append((raw_record, error_details))
 
     return resumes, invalid_resumes

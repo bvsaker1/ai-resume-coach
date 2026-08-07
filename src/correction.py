@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Correction pass for invalid/missing job and resume records from a prior
+Correction pass for invalid job and resume records from a prior
 dataset_generator.py run.
 
 Reads jobs_invalid_{iteration}.jsonl and resumes_invalid_{iteration}.jsonl,
-asks the LLM to fix (or, for missing slots, freshly generate) each record,
-re-validates with the SAME validate_job/validate_resume functions used at
-generation time, and writes results to *_corrected_{iteration}.jsonl /
-*_uncorrectable_{iteration}.jsonl. Never mutates the original run's output
-files.
+asks the LLM to fix each record, re-validates with the SAME
+validate_job/validate_resume functions used at generation time, and writes
+results to *_corrected_{iteration}.jsonl / *_uncorrectable_{iteration}.jsonl.
+Never mutates the original run's output files.
 
 Usage:
     python correction.py --iteration 1
@@ -19,8 +18,8 @@ Usage:
 
 import argparse
 import json
-import re
 import sys
+from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
@@ -29,14 +28,14 @@ import instructor
 
 from validation import JobPosting, JobContent, Resume, ResumeContent, ResumePair, RawJobBatch, RawResumeBatch, validate_job, validate_resume
 from llm_errors import is_fatal_llm_error
-from resume_generator import generate_resumes_for_job, build_single_resume_prompt
+from resume_generator import generate_resumes_for_job
 from dataset_generator import (
     DATA_DIR, ITERATION, GENERATION_MODEL,
     JOB_MAX_COMPLETION_TOKENS, RESUME_MAX_COMPLETION_TOKENS, NUM_RESUMES_PER_JOB,
     make_client, load_templates, Logger, backup_correction_outputs,
     append_jsonl, append_invalid_with_error,
-    build_jobs_batch_prompt, format_job_summary, get_shortcoming_instructions,
-    get_fit_level, _rate_limiter,
+    format_job_summary, get_shortcoming_instructions,
+    get_fit_level, find_max_trace_id_counter, LLM_REQUEST_TIMEOUT_SECONDS, _rate_limiter,
 )
 
 
@@ -74,19 +73,6 @@ def load_valid_jobs(iteration: int) -> dict[str, JobPosting]:
     return jobs
 
 
-def find_max_trace_id_counter(prefix: str, *paths: Path) -> int:
-    """Scan JSONL files for top-level 'trace_id' fields matching '{prefix}_N'
-    and return the max N found (0 if none / files missing)."""
-    pattern = re.compile(rf'"trace_id"\s*:\s*"{re.escape(prefix)}_(\d+)"')
-    max_n = 0
-    for path in paths:
-        if not path.exists():
-            continue
-        for match in pattern.finditer(path.read_text()):
-            max_n = max(max_n, int(match.group(1)))
-    return max_n
-
-
 # ── Job correction ────────────────────────────────────────────────────────────
 
 JOB_BATCH_WRAPPER_SUFFIX = (
@@ -120,20 +106,6 @@ substitute alternative field names:
 {schema_json}"""
 
 
-def build_job_regenerate_prompt(raw_record: dict) -> str:
-    """Missing-slot case: no content to fix, so this is a fresh single-job
-    generation call using the same context a normal generation call would have had."""
-    industry = raw_record.get("industry")
-    experience_level = raw_record.get("experience_level")
-    if not industry:
-        print(f"  WARNING: missing-job record {raw_record.get('trace_id')} has no 'industry' context "
-              f"(likely from a pre-enrichment invalid file); falling back to 'Unknown'.")
-        industry = "Unknown"
-    if not experience_level:
-        experience_level = "Mid"
-    return build_jobs_batch_prompt(industry, [experience_level])
-
-
 def correct_job_record(
     client: instructor.Instructor,
     raw_record: dict,
@@ -141,7 +113,7 @@ def correct_job_record(
     max_completion_tokens: int,
     logger: Logger,
 ) -> tuple[Optional[JobPosting], Optional[dict], Optional[dict]]:
-    """Attempt to correct one invalid/missing job record.
+    """Attempt to correct one invalid job record.
 
     Returns (job_posting, failure_error_details, corrected_raw_dict) — exactly
     one of the first two is non-None. Raises (does not catch) any exception
@@ -152,10 +124,7 @@ def correct_job_record(
     error_type = error_details.get("error_type")
     logger.correction_attempt(kind="job", trace_id=trace_id, original_error_type=str(error_type))
 
-    prompt = (
-        build_job_regenerate_prompt(raw_record) if error_type == "llm_missing_job"
-        else build_job_fix_prompt(raw_record, error_details)
-    ) + JOB_BATCH_WRAPPER_SUFFIX
+    prompt = build_job_fix_prompt(raw_record, error_details) + JOB_BATCH_WRAPPER_SUFFIX
 
     estimated_tokens = len(prompt) // 4 + max_completion_tokens
     _rate_limiter.wait_if_needed(estimated_tokens)
@@ -167,6 +136,7 @@ def correct_job_record(
             response_model=RawJobBatch,
             max_retries=3,
             max_completion_tokens=max_completion_tokens,
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         if is_fatal_llm_error(exc):
@@ -209,7 +179,7 @@ def run_job_corrections(
     max_completion_tokens: int,
     limit: Optional[int] = None,
 ) -> dict[str, JobPosting]:
-    """Process invalid/missing job records. Writes successes to corrected_file,
+    """Process invalid job records. Writes successes to corrected_file,
     failures (dual-line, same shape as the original invalid files) to
     uncorrectable_file. Returns trace_id -> JobPosting for every success, for
     merging into the resume-correction job_lookup. Propagates fatal exceptions."""
@@ -272,11 +242,6 @@ substitute alternative field names (e.g. no `work_experience`, `contact_informat
 {schema_json}"""
 
 
-def build_resume_regenerate_prompt(job: JobPosting, template: dict, fit_level: str) -> str:
-    """Missing-slot case: reuse the normal single-resume generation prompt verbatim."""
-    return build_single_resume_prompt(job, template, fit_level, resume_index_within_job=0)
-
-
 def correct_resume_record(
     client: instructor.Instructor,
     raw_record: dict,
@@ -286,7 +251,7 @@ def correct_resume_record(
     max_completion_tokens: int,
     logger: Logger,
 ) -> tuple[Optional[Resume], Optional[JobPosting], Optional[dict], Optional[dict]]:
-    """Attempt to correct one invalid/missing resume record.
+    """Attempt to correct one invalid resume record.
 
     Returns (resume, job_for_pairing, failure_error_details, corrected_raw_dict).
     If job_trace_id / fit_level / template context is missing from raw_record,
@@ -309,7 +274,7 @@ def correct_resume_record(
             "record_trace_id": trace_id, "stage": "resume_correction",
             "error_type": "correction_skipped_missing_job_context", "original_error_type": error_type,
             "validation_errors": [{
-                "msg": f"Cannot correct/regenerate without resolvable job context "
+                "msg": f"Cannot correct without resolvable job context "
                        f"(job_trace_id={job_trace_id!r}, fit_level={fit_level!r}, template={template_name!r})."
             }],
         }
@@ -318,10 +283,7 @@ def correct_resume_record(
 
     logger.correction_attempt(kind="resume", trace_id=trace_id, original_error_type=str(error_type))
 
-    prompt = (
-        build_resume_regenerate_prompt(job, template, fit_level) if error_type == "llm_missing_resume"
-        else build_resume_fix_prompt(raw_record, error_details, job, template, fit_level)
-    ) + RESUME_BATCH_WRAPPER_SUFFIX
+    prompt = build_resume_fix_prompt(raw_record, error_details, job, template, fit_level) + RESUME_BATCH_WRAPPER_SUFFIX
 
     estimated_tokens = len(prompt) // 4 + max_completion_tokens
     _rate_limiter.wait_if_needed(estimated_tokens)
@@ -333,6 +295,7 @@ def correct_resume_record(
             response_model=RawResumeBatch,
             max_retries=3,
             max_completion_tokens=max_completion_tokens,
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         if is_fatal_llm_error(exc):
@@ -393,7 +356,7 @@ def run_resume_corrections(
     max_completion_tokens: int,
     limit: Optional[int] = None,
 ) -> None:
-    """Process invalid/missing resume records. For each success, also writes
+    """Process invalid resume records. For each success, also writes
     the ResumePair — this is the only place ResumePairs get created for
     corrected records, and only happens when the job resolves in job_lookup.
     Propagates fatal exceptions."""
@@ -413,35 +376,75 @@ def run_resume_corrections(
             append_invalid_with_error(resumes_uncorrectable_file, raw_record, failure_error)
 
 
-# ── Opt-in follow-on: resumes for jobs that became valid via correction ──────
+# ── Follow-on: generate resumes for jobs that are short of them ──────────────
+#
+# Two situations feed into this same mechanism:
+#   1. A job was invalid at generation time and never went through resume
+#      generation at all (phase 2 there only loops over jobs already valid at
+#      that point) — becomes valid via correct_job_record, needs a full set.
+#   2. A job was valid and DID have resumes attempted, but the run aborted
+#      partway through phase 2 (or hit a shortfall the retry/make-up passes
+#      in dataset_generator.py couldn't fully cover) — needs however many
+#      more it's short of `--resumes-per-job`/`--resumes-per-corrected-job`.
+# Both are "this job needs N more resumes" — same generate_resumes_for_job()
+# call, just a different reason N > 0.
 
-def generate_resumes_for_newly_valid_jobs(
+def find_jobs_missing_resumes(
+    iteration: int, jobs: dict[str, JobPosting], resumes_per_job: int,
+) -> dict[str, int]:
+    """Returns {job_trace_id: shortfall} for every job in `jobs` with fewer
+    than `resumes_per_job` existing pairs in pairs_{iteration}.jsonl +
+    pairs_corrected_{iteration}.jsonl (a job with zero pairs has shortfall ==
+    resumes_per_job). Only jobs with shortfall > 0 are included."""
+    pair_counts: dict[str, int] = defaultdict(int)
+    for path in (DATA_DIR / f"pairs_{iteration}.jsonl", DATA_DIR / f"pairs_corrected_{iteration}.jsonl"):
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            job_trace_id = json.loads(line).get("job_trace_id")
+            if job_trace_id:
+                pair_counts[job_trace_id] += 1
+
+    return {
+        trace_id: resumes_per_job - pair_counts.get(trace_id, 0)
+        for trace_id in jobs
+        if pair_counts.get(trace_id, 0) < resumes_per_job
+    }
+
+
+def generate_resumes_for_jobs(
     client: instructor.Instructor,
     logger: Logger,
     iteration: int,
-    newly_valid_jobs: list[JobPosting],
+    job_resume_counts: dict[str, tuple[JobPosting, int]],
     templates: dict[str, dict],
-    resumes_per_job: int,
     max_completion_tokens: int,
     resumes_corrected_file,
     resumes_uncorrectable_file,
     pairs_corrected_file,
-) -> None:
-    """Jobs that were invalid at generation time never went through resume
-    generation in the original run (phase 2 there only loops over jobs already
-    valid at that point). This generates a first batch of resumes for each job
-    that just became valid via correct_job_record, reusing
-    generate_resumes_for_job() unchanged.
+) -> tuple[int, int]:
+    """Generates exactly `count` more resumes for each (job, count) in
+    job_resume_counts.values(), reusing generate_resumes_for_job() unchanged.
+    Returns (resumes_written, invalid_written).
 
     Counter safety: scans resumes_{iteration}.jsonl + resumes_corrected_{iteration}.jsonl
     for the current high-water mark and continues from there, so get_fit_level()'s
-    dataset-wide Excellent/Good/Partial/Poor cycling isn't disrupted.
+    dataset-wide Excellent/Good/Partial/Poor cycling isn't disrupted and no
+    trace_id collides with an existing resume.
     """
     next_n = find_max_trace_id_counter(
         "res", DATA_DIR / f"resumes_{iteration}.jsonl", DATA_DIR / f"resumes_corrected_{iteration}.jsonl",
     ) + 1
-    for job in newly_valid_jobs:
-        fit_levels = [get_fit_level(next_n - 1 + r) for r in range(resumes_per_job)]
+    resumes_written = 0
+    invalid_written = 0
+    for job, count in job_resume_counts.values():
+        if count <= 0:
+            continue
+        fit_levels = [get_fit_level(next_n - 1 + r) for r in range(count)]
+        print(f"  {job.trace_id} ({job.job_title}): generating {count} resume(s)...")
         resume_pairs, invalid_resumes = generate_resumes_for_job(
             client=client,
             logger=logger,
@@ -456,16 +459,19 @@ def generate_resumes_for_newly_valid_jobs(
         for resume, pair in resume_pairs:
             append_jsonl(resumes_corrected_file, resume)
             append_jsonl(pairs_corrected_file, pair)
+            resumes_written += 1
         for raw_resume, error_details in invalid_resumes:
             append_invalid_with_error(resumes_uncorrectable_file, raw_resume, error_details)
-        next_n += resumes_per_job
+            invalid_written += 1
+        next_n += count
+    return resumes_written, invalid_written
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Correct invalid/missing job and resume records from a prior dataset_generator.py run."
+        description="Correct invalid job and resume records from a prior dataset_generator.py run."
     )
     parser.add_argument(
         "--iteration", type=int, default=ITERATION,
@@ -482,6 +488,15 @@ def main() -> None:
         help="Opt-in: also generate a first batch of resumes for jobs that became valid via correction (additional LLM cost)",
     )
     parser.add_argument("--resumes-per-corrected-job", type=int, default=NUM_RESUMES_PER_JOB)
+    parser.add_argument(
+        "--backfill-missing-resumes", action="store_true",
+        help="Opt-in: generate resumes for any valid job with fewer than --resumes-per-job existing "
+             "pairs — e.g. jobs that never got resumes because a run aborted partway through phase 2, "
+             "or where the retry/make-up passes in dataset_generator.py still fell short. Independent "
+             "of --generate-resumes-for-corrected-jobs; runs even if there are no invalid records to correct.",
+    )
+    parser.add_argument("--resumes-per-job", type=int, default=NUM_RESUMES_PER_JOB,
+                         help=f"Target resume count per job for --backfill-missing-resumes (default: {NUM_RESUMES_PER_JOB})")
     args = parser.parse_args()
 
     jobs_invalid_path = DATA_DIR / f"jobs_invalid_{args.iteration}.jsonl"
@@ -492,8 +507,9 @@ def main() -> None:
     resumes_uncorrectable_path = DATA_DIR / f"resumes_uncorrectable_{args.iteration}.jsonl"
     pairs_corrected_path = DATA_DIR / f"pairs_corrected_{args.iteration}.jsonl"
 
-    if not jobs_invalid_path.exists() and not resumes_invalid_path.exists():
-        print(f"No jobs_invalid_{args.iteration}.jsonl or resumes_invalid_{args.iteration}.jsonl found. Nothing to correct.")
+    if not jobs_invalid_path.exists() and not resumes_invalid_path.exists() and not args.backfill_missing_resumes:
+        print(f"No jobs_invalid_{args.iteration}.jsonl or resumes_invalid_{args.iteration}.jsonl found, "
+              f"and --backfill-missing-resumes wasn't passed. Nothing to do.")
         return
 
     backup_correction_outputs(args.iteration)
@@ -547,11 +563,28 @@ def main() -> None:
 
             if args.generate_resumes_for_corrected_jobs and corrected_jobs:
                 print(f"\n  Generating resumes for {len(corrected_jobs)} newly-valid job(s)...")
-                generate_resumes_for_newly_valid_jobs(
-                    client, logger, args.iteration, list(corrected_jobs.values()), templates,
-                    args.resumes_per_corrected_job, args.resume_max_completion_tokens,
-                    rcf, ruf, pcf,
+                job_resume_counts = {
+                    trace_id: (job, args.resumes_per_corrected_job) for trace_id, job in corrected_jobs.items()
+                }
+                generate_resumes_for_jobs(
+                    client, logger, args.iteration, job_resume_counts, templates,
+                    args.resume_max_completion_tokens, rcf, ruf, pcf,
                 )
+
+            if args.backfill_missing_resumes:
+                shortfalls = find_jobs_missing_resumes(args.iteration, job_lookup, args.resumes_per_job)
+                if shortfalls:
+                    print(f"\n  Backfilling resumes for {len(shortfalls)} job(s) missing some/all resumes...")
+                    job_resume_counts = {
+                        trace_id: (job_lookup[trace_id], count) for trace_id, count in shortfalls.items()
+                    }
+                    written, invalid = generate_resumes_for_jobs(
+                        client, logger, args.iteration, job_resume_counts, templates,
+                        args.resume_max_completion_tokens, rcf, ruf, pcf,
+                    )
+                    print(f"  Backfill: {written} resume(s) written, {invalid} invalid.")
+                else:
+                    print("\n  No jobs are missing resumes — nothing to backfill.")
     except Exception as exc:
         aborted = True
         print(f"\n❌ Correction run aborted due to a fatal LLM/API error: {exc}")
